@@ -1,0 +1,463 @@
+# app.py ───────────────────────────────────────────────────────
+# Sistema de Gestión de Abastecimiento – MAUI  (SGA)
+# Interface clon de mock‑up + lógica Rastrero In / Out
+# PJLT · 2025
+# ───────────────────────────────────────────────────────────────
+import streamlit as st
+import pandas as pd
+import numpy as np
+from io import BytesIO
+import openpyxl, datetime as dt, re
+
+# =============================================================
+# CONFIGURACIÓN GLOBAL ‑‑ estilo y layout
+# =============================================================
+st.set_page_config(page_title="SGA – MAUI",
+                   page_icon="📦",
+                   layout="wide",
+                   initial_sidebar_state="expanded")
+
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
+html, body, [class*="css"]  { font-family:'Inter',sans-serif; }
+
+/* ---------- SIDEBAR ---------- */
+section[data-testid="stSidebar"]{
+    background-color:#001f54; width:235px;
+}
+section[data-testid="stSidebar"] > div:first-child{ padding-top:1rem; }
+.sidebar-logo{ display:flex; justify-content:center; margin-bottom:1.5rem; }
+.sidebar-logo img{ width:120px; }
+
+/* Radio‑menu */
+div[role="radiogroup"] > label{
+    color:#ffffff; font-weight:600;
+    padding:0.45rem 0.5rem 0.45rem 0.75rem;
+}
+div[role="radiogroup"] > label:hover{
+    background-color:#003074;
+}
+div[role="radiogroup"] > label[data-testid="stRadioButton"]:has(input:checked){
+    background-color:#0074ff !important;
+}
+.sidebar-footer{
+    position:absolute; bottom:25px; left:15px;
+    color:#eeeeee80; font-size:0.75rem;
+}
+
+/* ---------- HEADER PRINCIPAL ---------- */
+.header-box{ background:#f5f5f5; border-radius:4px; padding:1rem; }
+.header-box h2{ margin:0 0 4px 0; font-weight:600; }
+.status-ok   { color:#2e7d32; }
+.status-warn { color:#c62828; }
+
+/* Reducir padding default para que la barra superior sea compacta */
+#MainMenu {visibility:hidden;}
+footer {visibility:hidden;}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+# =============================================================
+# HELPERS GENERALES  (limpieza y pre‑proc. de datos)
+# =============================================================
+def clean_lote(series: pd.Series) -> pd.Series:
+    return (series.astype(str)
+                  .str.replace(r'\s+', '', regex=True)
+                  .str.replace('\u00A0', '')
+                  .str.strip())
+
+def clean_number(col: pd.Series) -> pd.Series:
+    s = (col.astype(str)
+             .str.replace(r'[^0-9,.-]', '', regex=True)
+             .str.replace('.', '', regex=False)
+             .str.replace(',', '.', regex=False))
+    return pd.to_numeric(s, errors='coerce').fillna(0.0)
+
+def preparar_stock(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes))
+    df.columns = (df.columns.str.normalize('NFKD')
+                            .str.encode('ascii','ignore').str.decode('utf-8')
+                            .str.strip())
+    df['Lote Proveedor']  = clean_lote(df['Lote Proveedor'])
+    df['Cant. Final UMS'] = clean_number(df['Cant. Final UMS'])
+    df['Concat_U_A']      = df['Ubicacion'] + df['Cod. Articulo']
+
+    def factor(s):
+        n = s.astype(str).str.extract(r'C(\d+(?:\.\d+)?)U', expand=False)
+        return pd.to_numeric(n, errors='coerce').fillna(1)
+    df['Factor'] = factor(df['Huella'])
+    df['Cajas']  = df['Cant. Final UMS'] / df['Factor']
+    df['UM']     = 'CAJ'
+
+    def nivel(s):
+        ult = s.str[-1]
+        return np.where(ult.str.isnumeric() & (ult.astype(int) < 3), 'BAJO', 'ALTO')
+    df['Nivel'] = nivel(df['Ubicacion'])
+
+    keep = ['Concat_U_A','Ubicacion','Cod. Articulo','Factor','UM',
+            'Nivel','Lote Proveedor','Cant. Final UMS','Cajas']
+    grp  = ['Concat_U_A','Ubicacion','Cod. Articulo',
+            'Factor','UM','Nivel','Lote Proveedor']
+    df_bd = (df[keep].groupby(grp, as_index=False)
+                     .agg({'Cant. Final UMS':'sum','Cajas':'sum'})
+                     .rename(columns={'Ubicacion':'Ubicación',
+                                      'Cod. Articulo':'Cod. Artículo'}))
+    return df_bd
+
+def factor_huella(col):
+    return (col.astype(str)
+                .str.extract(r'C(\d+(?:\.\d+)?)U', expand=False)
+                .astype(float)
+                .fillna(1))
+
+def calc_pasillo(u: str) -> str:
+    if len(u) < 11:
+        return 'Libre'
+    if u[3:5] == 'MR':
+        return 'Pasillo_1'
+    tramo = u[8:11]
+    if tramo in ('C06', 'C07', 'C08'):
+        return 'Pasillo_1'
+    if tramo in ('C09', 'C10'):
+        return 'Pasillo_2'
+    if tramo in ('C11', 'C12'):
+        return 'Pasillo_3'
+    return 'Libre'
+
+# =============================================================
+# ESTADO DE SESIÓN
+# =============================================================
+if "rastrero_in" not in st.session_state:
+    st.session_state.rastrero_in = dict()   # df_ing, df_stock, ...
+if "rastrero_out" not in st.session_state:
+    st.session_state.rastrero_out = dict()
+
+# =============================================================
+# COMPONENTE DE ESTATUS GLOBAL (icono + barra progreso)
+# =============================================================
+status_placeholder = st.empty()
+progress_bar       = st.progress(0)
+
+def update_status(msg:str, pct:int|None = None, ok:bool = True):
+    icon = "check-circle" if ok else "exclamation-triangle"
+    clazz= "status-ok" if ok else "status-warn"
+    status_placeholder.markdown(
+        f"<span class='{clazz}'><i class='fa fa-{icon}'></i> {msg}</span>",
+        unsafe_allow_html=True)
+    if pct is not None:
+        progress_bar.progress(pct)
+
+# =============================================================
+# SIDEBAR  (logo + menú)
+# =============================================================
+with st.sidebar:
+    st.markdown(
+        '<div class="sidebar-logo"><img src="https://raw.githubusercontent.com/streamlit/example-data/master/img/logo-sga.png" alt="SGA"></div>',
+        unsafe_allow_html=True)
+
+    menu_opt = st.radio(
+        "Menú",
+        ["Inicio", "Realizar Análisis", "Registro de OC’s", "Consultar BD", "Salir"],
+        label_visibility="collapsed"
+    )
+
+    st.markdown('<div class="sidebar-footer">Developed by: <b>PJLT</b></div>',
+                unsafe_allow_html=True)
+
+# =============================================================
+# 1. PÁGINA INICIO
+# =============================================================
+if menu_opt == "Inicio":
+    update_status("Bienvenido", 0, True)
+    st.info("Para acceder a los archivos de OneDrive, por favor inicie sesión.")
+    col1, col2 = st.columns([1, 9])
+    with col1:
+        st.image("https://raw.githubusercontent.com/streamlit/example-data/master/img/logo-dinet.png",
+                 width=120)
+    with col2:
+        st.markdown(
+            """
+            <div class="header-box">
+                <h2>Sistema de Gestión de Abastecimiento ‑ MAUI</h2>
+                <small>Developed by: PJLT</small><br>
+                <small>Este sistema realiza análisis y registro de datos de abastecimiento.</small>
+            </div>
+            """,
+            unsafe_allow_html=True)
+    st.success("Selecciona una opción en la barra lateral para comenzar.")
+
+
+# =============================================================
+# 2. PÁGINA REALIZAR ANÁLISIS  (tabs: Rastrero In / Out)
+# =============================================================
+elif menu_opt == "Realizar Análisis":
+    tab_in, tab_out = st.tabs(["▼ Rastrero In", "▲ Rastrero Out"])
+
+    # ---------------------------------------------------------------------
+    # -------- TAB  RASTRERO IN ------------------------------------------
+    # ---------------------------------------------------------------------
+    with tab_in:
+        state = st.session_state.rastrero_in
+        st.header("📥 Rastrero In")
+
+        # ------------- Carga de archivos -------------
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            file_ing = st.file_uploader("Flujo de Ingresos (.xlsx)", type="xlsx",
+                                        key="in_ing")
+        with c2:
+            file_stock = st.file_uploader("Stock (.xlsx)", type="xlsx",
+                                          key="in_stock")
+        with c3:
+            file_tmpl = st.file_uploader("Plantilla (.xlsx)", type="xlsx",
+                                         key="in_tmpl")
+
+        fecha_in = st.date_input("Fecha del reporte", dt.date.today(), key="in_fecha")
+
+        # ---- Parse Flujo Ingresos ----
+        if file_ing and "df_ing" not in state:
+            if not file_ing.name.startswith("ReportConsultasIngresosFlujoIngresos"):
+                update_status("⚠️ Archivo de ingresos incorrecto", 0, False)
+            else:
+                update_status("Leyendo Flujo Ingresos …", 15)
+                df_ing = pd.read_excel(file_ing)
+                df_ing.columns = (df_ing.columns.str.normalize('NFKD')
+                                             .str.encode('ascii','ignore').str.decode('utf-8')
+                                             .str.strip())
+                df_ing['Codigo Lote Proveedor'] = clean_lote(df_ing['Codigo Lote Proveedor'])
+                state["df_ing"] = df_ing
+                state["motivos"] = ['Todos']+sorted(df_ing['Motivo'].dropna().unique())
+                update_status("Ingresos listos ✓", 35)
+
+        # ---- Parse Stock ----
+        if file_stock and "df_stock" not in state:
+            update_status("Procesando Stock …", 15)
+            state["df_stock"] = preparar_stock(file_stock.getvalue())
+            update_status("Stock listo ✓", 60 if "df_ing" in state else 35)
+
+        # ------------ Interface de filtros ------------
+        if "df_ing" in state:
+            motivo = st.selectbox("Motivo de ingreso",
+                                  state["motivos"], key="in_motivo")
+            base_ing = state["df_ing"]
+            if motivo != "Todos":
+                base_ing = base_ing[base_ing['Motivo']==motivo]
+            vista = (base_ing[['Codigo Lote Proveedor','Referencia']]
+                     .drop_duplicates().reset_index(drop=True))
+            lotes_sel = st.multiselect(
+                "Selecciona los lotes a incluir",
+                options=vista['Codigo Lote Proveedor'],
+                default=list(vista['Codigo Lote Proveedor'])
+            )
+
+        # ------------ Generar Rastrero ------------
+        btn_gen = st.button("⚙️ Generar Rastrero", disabled=not(
+            file_ing and file_stock and lotes_sel))
+        if btn_gen:
+            base = state["df_stock"].copy()
+            base['Lote Proveedor'] = clean_lote(base['Lote Proveedor'])
+            filtrado = base[base['Lote Proveedor'].isin(lotes_sel)].copy()
+
+            filtrado = filtrado.rename(columns={
+                'Concat_U_A': 'Concat_U_A_1',
+                'Ubicación' : 'Ubicación_Z',
+                'Cod. Artículo': 'Cod. Artículo_Z',
+                'Cajas' : 'Cajas_Z',
+                'Nivel' : 'Nivel_Z'
+            })
+            lookup = base.groupby('Concat_U_A')['Cajas'].sum()
+            filtrado['Stock_Final']   = filtrado['Concat_U_A_1'].map(lookup).fillna(0.0)
+            filtrado['Stock_Inicial'] = filtrado['Stock_Final'] - filtrado['Cajas_Z']
+            filtrado['Check'] = ''
+            filtrado['Observaciones'] = ''
+
+            keep = ['Ubicación_Z','Cod. Artículo_Z','UM',
+                    'Stock_Inicial','Cajas_Z','Stock_Final',
+                    'Check','Observaciones','Nivel_Z']
+            state["ras_in"] = filtrado[keep]
+
+            alto = state["ras_in"][state["ras_in"]['Nivel_Z']=='ALTO'].drop(columns='Nivel_Z')
+            bajo = state["ras_in"][state["ras_in"]['Nivel_Z']=='BAJO'].drop(columns='Nivel_Z')
+
+            st.success("Rastrero In generado")
+            st.subheader("Nivel ALTO")
+            st.dataframe(alto, use_container_width=True)
+            st.subheader("Nivel BAJO")
+            st.dataframe(bajo, use_container_width=True)
+            update_status("Rastrero In generado ✓", 100)
+
+        # ------------ Descargar Excel ------------
+        if file_tmpl and "ras_in" in state and fecha_in:
+            def make_xlsx_in():
+                wb = openpyxl.load_workbook(BytesIO(file_tmpl.getvalue()))
+                alto = state["ras_in"][state["ras_in"]['Nivel_Z']=='ALTO'].drop(columns='Nivel_Z')
+                bajo = state["ras_in"][state["ras_in"]['Nivel_Z']=='BAJO'].drop(columns='Nivel_Z')
+
+                def paste_df(ws, df, r0=13, c0=2):
+                    for i,row in enumerate(df.itertuples(index=False),start=r0):
+                        for j,val in enumerate(row,start=c0):
+                            ws.cell(row=i,column=j,value=val)
+
+                paste_df(wb['R_Nivel_Alto'], alto)
+                paste_df(wb['R_Nivel_Bajo'], bajo)
+                for ws in (wb['R_Nivel_Alto'], wb['R_Nivel_Bajo']):
+                    ws['I1'].value = fecha_in.strftime('%d/%m/%Y')
+                out = BytesIO(); wb.save(out); out.seek(0); return out
+
+            fname = f"FORMATO_RASTRERO_INGRESOS_{fecha_in.strftime('%d.%m.%Y')}.xlsx"
+            st.download_button("📥 Descargar Excel",
+                               data=make_xlsx_in(),
+                               file_name=fname,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ---------------------------------------------------------------------
+    # -------- TAB  RASTRERO OUT -----------------------------------------
+    # ---------------------------------------------------------------------
+    with tab_out:
+        state = st.session_state.rastrero_out
+        st.header("📤 Rastrero Out")
+
+        # ------- Carga de archivos -------
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            file_asig = st.file_uploader("Asignación (.xlsx)", type="xlsx",
+                                         key="out_asig")
+        with c2:
+            file_stock_o = st.file_uploader("Stock (.xlsx)", type="xlsx",
+                                            key="out_stock")
+        with c3:
+            file_tmpl_o  = st.file_uploader("Plantilla (.xlsx)", type="xlsx",
+                                            key="out_tmpl")
+
+        fecha_out = st.date_input("Fecha del reporte", dt.date.today(), key="out_fecha")
+
+        headers_asig = ['Estado','Nro. Picking','Usuario Picking','Cliente','Ubicacion',
+                        'Cod. Articulo','Articulo','Cant. Pick. UMS','Huella']
+
+        # ---- Parse Asignación ----
+        if file_asig and "df_asig_raw" not in state:
+            df = pd.read_excel(file_asig)
+            df.columns = (df.columns.str.normalize('NFKD')
+                                    .str.encode('ascii','ignore').str.decode('utf-8')
+                                    .str.strip())
+            if not all(c in df.columns for c in headers_asig):
+                update_status("⚠️ Cabeceras de asignación incorrectas", 0, False)
+            else:
+                df = df[headers_asig].copy()
+                df['Factor']   = factor_huella(df['Huella'])
+                df['Cajas_x']  = df['Cant. Pick. UMS'] / df['Factor']
+                df['Concat1']  = df['Ubicacion'] + df['Cod. Articulo']
+                df['Cliente_ext'] = df['Cliente'].str.split('|').str[1].fillna(df['Cliente'])
+                state['df_asig_raw'] = df
+                update_status("Asignación lista ✓", 25)
+
+        # ---- Parse Stock ----
+        if file_stock_o and "stock" not in state:
+            df = pd.read_excel(file_stock_o)
+            df = df[['Ubicacion','Cod. Articulo','Articulo','Cant. Final UMS','Huella']]
+            df['Factor'] = factor_huella(df['Huella'])
+            df['Cajas_y']= df['Cant. Final UMS']/df['Factor']
+            df['Concat2']= df['Ubicacion']+df['Cod. Articulo']
+            state['stock'] = (df.groupby('Concat2', as_index=False)
+                                .agg({'Cant. Final UMS':'sum','Cajas_y':'sum',
+                                      'Ubicacion':'first','Cod. Articulo':'first'}))
+            update_status("Stock listo ✓", 50 if "df_asig_raw" in state else 25)
+
+        # ---- Selector de pickings ----
+        if "df_asig_raw" in state:
+            picks = sorted(state['df_asig_raw']['Nro. Picking'].dropna().unique())
+            picks_sel = st.multiselect("Filtrar por Nro. Picking",
+                                       options=picks,
+                                       default=picks,
+                                       key="out_picks")
+            df_work = state['df_asig_raw'][state['df_asig_raw']['Nro. Picking'].isin(picks_sel)]
+            # Tablas resumen
+            state['tpick'] = (df_work.groupby('Nro. Picking', as_index=False)
+                                         .agg({'Cant. Pick. UMS':'sum','Cajas_x':'sum'}))
+            state['tcli']  = (df_work.groupby(['Nro. Picking','Cliente_ext'], as_index=False)
+                                         .agg({'Cant. Pick. UMS':'sum','Cajas_x':'sum'})
+                                         .rename(columns={'Cliente_ext':'Cliente'}))
+            state['asign'] = (df_work.groupby(['Concat1','Ubicacion','Cod. Articulo'],
+                                              as_index=False)['Cajas_x'].sum())
+
+        # ---- Generar rastrero ----
+        btn_gen_o = st.button("⚙️ Generar Rastrero", disabled=not(
+            ("asign" in state) and ("stock" in state)))
+        if btn_gen_o:
+            bd = pd.merge(state['asign'], state['stock'],
+                          left_on='Concat1', right_on='Concat2', how='left',
+                          suffixes=('_asig','_stk'))
+            bd['UM'] = 'CAJ'
+            bd['Salidas']       = bd['Cajas_x']
+            bd['Stock Final']   = bd['Cajas_y'].fillna(0)
+            bd['Stock Inicial'] = bd['Salidas'] + bd['Stock Final']
+            bd['Check']         = ''
+            bd['Observacion']   = ''
+            bd['Ubicacion_out'] = bd['Ubicacion_stk'].combine_first(bd['Ubicacion_asig'])
+            bd['Pasillo']       = bd['Ubicacion_out'].apply(calc_pasillo)
+
+            cols = ['Ubicacion_out','Cod. Articulo_asig','UM',
+                    'Stock Inicial','Salidas','Stock Final',
+                    'Check','Observacion']
+            state['ras_p1'] = bd[bd['Pasillo']=='Pasillo_1'][cols]
+            state['ras_p2'] = bd[bd['Pasillo']=='Pasillo_2'][cols]
+            state['ras_p3'] = bd[bd['Pasillo']=='Pasillo_3'][cols]
+
+            st.success("Rastrero Out generado")
+            for name, df_p in [("Pasillo 1", state['ras_p1']),
+                               ("Pasillo 2", state['ras_p2']),
+                               ("Pasillo 3", state['ras_p3'])]:
+                st.subheader(name)
+                st.dataframe(df_p, use_container_width=True)
+            update_status("Rastrero Out generado ✓", 100)
+
+        # ---- Descargar Excel ----
+        if file_tmpl_o and all(k in state for k in ('ras_p1','ras_p2','ras_p3')) and fecha_out:
+            def make_xlsx_out():
+                wb = openpyxl.load_workbook(BytesIO(file_tmpl_o.getvalue()))
+                def paste_df(ws, df, r0=13, c0=2):
+                    for i,row in enumerate(df.itertuples(index=False),start=r0):
+                        for j,val in enumerate(row,start=c0):
+                            ws.cell(row=i,column=j,value=val)
+
+                for hoja, df_p in {"Pasillo_1":state['ras_p1'],
+                                   "Pasillo_2":state['ras_p2'],
+                                   "Pasillo_3":state['ras_p3']}.items():
+                    ws = wb[hoja] if hoja in wb.sheetnames else wb.create_sheet(hoja)
+                    paste_df(ws, df_p)
+                    for i,pk in enumerate(state['tpick']['Nro. Picking'], start=1):
+                        ws.cell(row=i,column=12,value=str(pk))
+                    ws['I1'].value = fecha_out.strftime('%d/%m/%Y')
+                out = BytesIO(); wb.save(out); out.seek(0); return out
+
+            fname = f"FORMATO_RASTRERO_SALIDAS_{fecha_out.strftime('%d.%m.%Y')}.xlsx"
+            st.download_button("📥 Descargar Excel",
+                               data=make_xlsx_out(),
+                               file_name=fname,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# =============================================================
+# 3. PÁGINA REGISTRO DE OC’s   (placeholder)
+# =============================================================
+elif menu_opt == "Registro de OC’s":
+    update_status("Módulo Registro de OC’s", 0, True)
+    st.header("📝 Registro de Órdenes de Compra")
+    st.warning("TODO: Implementar formulario de registro de OC’s.")
+
+# =============================================================
+# 4. PÁGINA CONSULTAR BD   (placeholder)
+# =============================================================
+elif menu_opt == "Consultar BD":
+    update_status("Módulo Consulta BD", 0, True)
+    st.header("📖 Consulta de Base de Datos")
+    st.warning("TODO: Implementar motor de búsqueda / tablas.")
+
+# =============================================================
+# 5. PÁGINA SALIR
+# =============================================================
+elif menu_opt == "Salir":
+    st.success("Has cerrado la sesión. ¡Hasta pronto!")
+    update_status("Sesión finalizada", 0, True)
