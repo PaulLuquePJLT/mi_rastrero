@@ -9,6 +9,7 @@ from io import BytesIO
 import re, gc, datetime as dt
 import openpyxl
 from streamlit_option_menu import option_menu
+
 # -------------------------------------------------------------
 # 1. Configuración global y estilos
 # -------------------------------------------------------------
@@ -251,6 +252,19 @@ def rastrero_in():
 # =============================================================
 # 6. Módulo Rastrero Out
 # =============================================================
+def calc_nivel(u_out: str) -> str:
+    # u_out viene de bd['Ubicacion_out']
+    if pd.isna(u_out):
+        return ''
+    # caso “MR” en posiciones 5–6 (índices 4 y 5)
+    if u_out[4:6] == 'MR':
+        return 'B'
+    # último carácter numérico
+    last = u_out.strip()[-1]
+    if last.isnumeric() and int(last) <= 2:
+        return 'B'
+    return 'A'
+
 def rastrero_out():
     st.subheader("📤 Rastrero Out")
     state = st.session_state.state_out
@@ -352,52 +366,90 @@ def rastrero_out():
             how='left', suffixes=('_asig','_stk')
         )
         bd['UM'] = 'CAJ'
-        bd['Salidas'] = bd['Cajas_x']
-        bd['Stock Final'] = bd['Cajas_y'].fillna(0)
+        bd['Salidas']       = bd['Cajas_x']
+        bd['Stock Final']   = bd['Cajas_y'].fillna(0)
         bd['Stock Inicial'] = bd['Salidas'] + bd['Stock Final']
-        bd['Check'] = ''
-        bd['Observacion'] = ''
+        bd['Check']         = ''
+        bd['Observacion']   = ''
         bd['Ubicacion_out'] = bd['Ubicacion_stk'].combine_first(bd['Ubicacion_asig'])
-        bd['Pasillo'] = bd['Ubicacion_out'].apply(calc_pasillo)
+        bd['Pasillo']       = bd['Ubicacion_out'].apply(calc_pasillo)
+        bd['Nivel']         = bd['Ubicacion_out'].apply(calc_nivel)
+        bd['Zona']          = bd['Pasillo'] + '_' + bd['Nivel']
 
+        # Excluir filas con pasillo Libre
+        bd = bd[bd['Pasillo'] != 'Libre']
+
+        # Definir columnas que queremos en las tablas finales
         cols_export = ['Ubicacion_out','Cod. Articulo_asig','UM',
                        'Stock Inicial','Salidas','Stock Final',
                        'Check','Observacion']
-        ras1 = bd[bd['Pasillo']=='Pasillo_1'][cols_export]
-        ras2 = bd[bd['Pasillo']=='Pasillo_2'][cols_export]
-        ras3 = bd[bd['Pasillo']=='Pasillo_3'][cols_export]
 
-        state['ras_out'] = {'Pasillo_1':ras1,'Pasillo_2':ras2,'Pasillo_3':ras3}
-        st.success("Rastrero Out generado ✓")
-        st.markdown("### Pasillo 1")
-        st.dataframe(ras1, use_container_width=True)
-        st.markdown("### Pasillo 2")
-        st.dataframe(ras2, use_container_width=True)
-        st.markdown("### Pasillo 3")
-        st.dataframe(ras3, use_container_width=True)
+        # Crear nuevas tablas sólo con esos encabezados, por cada zona
+        tablas = {}
+        for zona, grupo in bd.groupby('Zona'):
+            # Asegurarnos que zona sea de los 3 pasillos y niveles A/B
+            if zona.startswith(('Pasillo_1','Pasillo_2','Pasillo_3')):
+                df_tab = grupo[cols_export].reset_index(drop=True)
+                tablas[zona] = df_tab
+                st.markdown(f"### {zona.replace('_',' — ')}")
+                st.dataframe(df_tab, use_container_width=True)
+
+        # Guardar en sesión para la exportación
+        state['ras_out'] = tablas
         update_status("Rastrero Out listo ✓", 100)
-
-    # --------------------------------------
-    # 6) Descarga a Excel
-    # --------------------------------------
+    
+    # 6) Descarga a Excel en bloque según las tablas generadas
     if tmpl_file and 'ras_out' in state:
+        tmpl_bytes = tmpl_file.read()
+        try:
+            wb = openpyxl.load_workbook(BytesIO(tmpl_bytes))
+        except Exception as e:
+            st.error(f"Error al leer la plantilla: {e}")
+            return
+
+        # Comprobar que existan todas las hojas necesarias
+        faltantes = [z for z in state['ras_out'] if z not in wb.sheetnames]
+        if faltantes:
+            st.error(f"No se encontraron las hojas: {', '.join(faltantes)} en la plantilla.")
+            return
+
         def make_xlsx_out():
-            wb = openpyxl.load_workbook(BytesIO(tmpl_file.read()))
-            # pegar cada pasillo
+            wb2 = openpyxl.load_workbook(BytesIO(tmpl_bytes))
             for hoja, dfp in state['ras_out'].items():
-                ws = wb[hoja] if hoja in wb.sheetnames else wb.create_sheet(hoja)
+                ws = wb2[hoja]
+                # 1) Pegado de datos desde B13
                 for i, row in enumerate(dfp.itertuples(index=False), start=13):
                     for j, val in enumerate(row, start=2):
                         ws.cell(row=i, column=j, value=val)
+                # 2) Fecha en I1
                 ws['I1'] = fecha.strftime('%d/%m/%Y')
-            out = BytesIO()
-            wb.save(out)
-            out.seek(0)
-            return out
+                # 3) Nro. Picking en L1↓
+                for idx, pk in enumerate(state['tpick']['Nro. Picking'], start=1):
+                    ws.cell(row=idx, column=12, value=pk)
+                # 4) Eliminar filas vacías tras la última con datos
+                last_row = 12 + len(dfp)
+                if ws.max_row > last_row:
+                    ws.delete_rows(last_row+1, ws.max_row - last_row)
+                # 5) Fijar área de impresión de B1 hasta I<last_row>
+                ws.print_area = f"B1:I{last_row}"
+
+            buf = BytesIO()
+            wb2.save(buf)
+            buf.seek(0)
+            return buf
+
+
+
         fname = f"FORMATO_RASTRERO_SALIDAS_{fecha.strftime('%d.%m.%Y')}.xlsx"
-        st.download_button("📥 Descargar Excel Salidas",
-                           data=make_xlsx_out(), file_name=fname,
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button(
+            "📥 Descargar Excel Salidas",
+            data=make_xlsx_out(),
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+
+
 
 # -------------------------------------------------------------
 # 7. Navegación principal con streamlit-option-menu
