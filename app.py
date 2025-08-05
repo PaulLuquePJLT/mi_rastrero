@@ -252,59 +252,82 @@ def rastrero_in():
 # =============================================================
 # 6. Módulo Rastrero Out
 # =============================================================
+def calc_pasillo(u: str) -> str:
+    if not isinstance(u, str) or len(u) < 11:
+        return 'Libre'
+    if u[3:5] == 'MR':
+        return 'Pasillo_1'
+    tramo = u[8:11]
+    if tramo in ('C06','C07','C08'):
+        return 'Pasillo_1'
+    if tramo in ('C09','C10'):
+        return 'Pasillo_2'
+    if tramo in ('C11','C12'):
+        return 'Pasillo_3'
+    return 'Libre'
+
+
 def calc_nivel(u_out: str) -> str:
-    # u_out viene de bd['Ubicacion_out']
-    if pd.isna(u_out):
+    if not isinstance(u_out, str) or pd.isna(u_out):
         return ''
-    # caso “MR” en posiciones 5–6 (índices 4 y 5)
-    if u_out[4:6] == 'MR':
+    if len(u_out) >= 6 and u_out[4:6] == 'MR':
         return 'B'
-    # último carácter numérico
     last = u_out.strip()[-1]
-    if last.isnumeric() and int(last) <= 2:
-        return 'B'
-    return 'A'
+    return 'B' if last.isdigit() and int(last) <= 2 else 'A'
+
 
 def rastrero_out():
     st.subheader("📤 Rastrero Out")
     state = st.session_state.state_out
 
-    # --------------------------------------
-    # 1) Carga de archivos y fecha
-    # --------------------------------------
+    # 1) Carga de archivos
     col1, col2, col3 = st.columns(3)
     with col1:
-        asig_file = st.file_uploader("Asignación (📑)", type="xlsx", key="asig_out")
+        asig_file = st.file_uploader("📑 Asignación (xlsx)", type="xlsx", key="asig_out")
     with col2:
-        stock_file = st.file_uploader("Stock (📦)", type="xlsx", key="stock_out")
+        stock_file = st.file_uploader("📦 Stock (xlsx)", type="xlsx", key="stock_out")
     with col3:
-        tmpl_file = st.file_uploader("Plantilla (🖋️)", type="xlsx", key="tmpl_out")
-    fecha = st.date_input("Fecha del reporte", dt.date.today(), key="fecha_out")
+        tmpl_file = st.file_uploader("🖋️ Plantilla (xlsx)", type="xlsx", key="tmpl_out")
 
-    # --------------------------------------
-    # 2) Lectura y preparación de asignación
-    # --------------------------------------
-    headers_asig = ['Estado','Nro. Picking','Usuario Picking','Cliente','Ubicacion',
-                    'Cod. Articulo','Articulo','Cant. Pick. UMS','Huella']
+    # 2) Lectura inicial de asignación
+    headers = ['Estado','Nro. Picking','Usuario Picking','Cliente','Ubicacion',
+               'Cod. Articulo','Articulo','Cant. Pick. UMS','Huella']
     if asig_file and 'df_asig_raw' not in state:
         update_status("Leyendo asignación…", 10)
         df_raw = norm_cols(pd.read_excel(asig_file))
-        if not all(h in df_raw.columns for h in headers_asig):
-            update_status("⚠️ Cabeceras de asignación incorrectas", 0, False)
+        if not all(h in df_raw.columns for h in headers):
+            update_status("⚠️ Cabeceras incorrectas", 0, False)
             return
-        df = df_raw[headers_asig].copy()
+        df = df_raw[headers].copy()
         df['Factor'] = factor(df['Huella'])
         df['Cajas_x'] = df['Cant. Pick. UMS'] / df['Factor']
         df['Concat1'] = df['Ubicacion'] + df['Cod. Articulo']
         df['Cliente_ext'] = df['Cliente'].str.split('|').str[1].fillna(df['Cliente'])
         state['df_asig_raw'] = df
-        # construir selección de pickings
-        picks = sorted(df['Nro. Picking'].dropna().unique())
-        state['picks_sel'] = st.multiselect("Filtrar Pickings", picks, default=picks, key="sel_pickings")
+        st.session_state.picks_sel = sorted(df['Nro. Picking'].dropna().unique())
 
-    # --------------------------------------
-    # 3) Lectura y preparación de stock
-    # --------------------------------------
+        # 3) Filtro de Pickings y Fecha lado a lado
+    if 'df_asig_raw' in state:
+        all_picks = sorted(state['df_asig_raw']['Nro. Picking'].dropna().unique())
+        # inicializar picks_sel en session_state una sola vez
+        if 'picks_sel' not in st.session_state:
+            st.session_state.picks_sel = all_picks
+        col_date, col_filter = st.columns([1,2])
+        with col_date:
+            fecha = st.date_input(
+                "📅 Fecha del reporte",
+                st.session_state.get('fecha_out', dt.date.today()),
+                key="fecha_out"
+            )
+        with col_filter:
+            # multiselect sin default, ligando directamente a session_state
+            st.multiselect(
+                "🔎 Filtrar Pickings",
+                options=all_picks,
+                key="picks_sel"
+            )
+
+    # 4) Lectura de stock
     if stock_file and 'df_stock' not in state:
         update_status("Leyendo stock…", 10)
         df2 = norm_cols(pd.read_excel(stock_file))
@@ -312,93 +335,46 @@ def rastrero_out():
         df2['Factor'] = factor(df2['Huella'])
         df2['Cajas_y'] = df2['Cant. Final UMS'] / df2['Factor']
         df2['Concat2'] = df2['Ubicacion'] + df2['Cod. Articulo']
-        state['df_stock'] = (
-            df2.groupby('Concat2', as_index=False)
-               .agg({
-                   'Cant. Final UMS':'sum',
-                   'Cajas_y':'sum',
-                   'Ubicacion':'first',
-                   'Cod. Articulo':'first'
-               })
-        )
+        state['df_stock'] = df2.groupby('Concat2', as_index=False).agg({
+            'Cant. Final UMS':'sum','Cajas_y':'sum',
+            'Ubicacion':'first','Cod. Articulo':'first'
+        })
         update_status("Stock listo ✓", 60)
 
-    # --------------------------------------
-    # 4) Reconstruir resúmenes cuando cambian picks
-    # --------------------------------------
-    if 'df_asig_raw' in state and 'picks_sel' in state:
-        df_filtered = state['df_asig_raw'][
-            state['df_asig_raw']['Nro. Picking'].isin(state['picks_sel'])
-        ]
-        # resumen por picking
-        state['tpick'] = (
-            df_filtered.groupby('Nro. Picking', as_index=False)
-                       .agg({'Cant. Pick. UMS':'sum', 'Cajas_x':'sum'})
-        )
-        # resumen por cliente
-        state['tcli'] = (
-            df_filtered.groupby(['Nro. Picking','Cliente_ext'], as_index=False)
-                       .agg({'Cant. Pick. UMS':'sum','Cajas_x':'sum'})
-                       .rename(columns={'Cliente_ext':'Cliente'})
-        )
-        # asignación consolidada
-        state['asign'] = (
-            df_filtered.groupby(['Concat1','Ubicacion','Cod. Articulo'],
-                                  as_index=False)['Cajas_x']
-                      .sum()
-        )
-        # mostrar tablas de resumen
-        st.markdown("**T_Picking**")
-        st.dataframe(state['tpick'], use_container_width=True)
-        st.markdown("**T_Clientes**")
-        st.dataframe(state['tcli'], use_container_width=True)
+    # 5) Resúmenes automáticos tras multiselect
+    picks = st.session_state.get('picks_sel', [])
+    if 'df_asig_raw' in state and picks:
+        df_f = state['df_asig_raw'][state['df_asig_raw']['Nro. Picking'].isin(picks)]
+        state['tpick'] = df_f.groupby('Nro. Picking', as_index=False).agg({'Cant. Pick. UMS':'sum','Cajas_x':'sum'})
+        state['tcli'] = df_f.groupby(['Nro. Picking','Cliente_ext'], as_index=False).agg({'Cant. Pick. UMS':'sum','Cajas_x':'sum'}).rename(columns={'Cliente_ext':'Cliente'})
+        state['asign'] = df_f.groupby(['Concat1','Ubicacion','Cod. Articulo'], as_index=False)['Cajas_x'].sum()
+        st.markdown("**T_Picking**"); st.dataframe(state['tpick'], use_container_width=True)
+        st.markdown("**T_Clientes**"); st.dataframe(state['tcli'], use_container_width=True)
         update_status("Resúmenes listos ✓", 80)
 
-    # --------------------------------------
-    # 5) Generar rastrero final y mostrar
-    # --------------------------------------
-    if st.button("Generar Rastrero Out", disabled=not(
-        'asign' in state and 'df_stock' in state
-    )):
-        bd = pd.merge(
-            state['asign'], state['df_stock'],
-            left_on='Concat1', right_on='Concat2',
-            how='left', suffixes=('_asig','_stk')
-        )
-        bd['UM'] = 'CAJ'
-        bd['Salidas']       = bd['Cajas_x']
-        bd['Stock Final']   = bd['Cajas_y'].fillna(0)
-        bd['Stock Inicial'] = bd['Salidas'] + bd['Stock Final']
-        bd['Check']         = ''
-        bd['Observacion']   = ''
-        bd['Ubicacion_out'] = bd['Ubicacion_stk'].combine_first(bd['Ubicacion_asig'])
-        bd['Pasillo']       = bd['Ubicacion_out'].apply(calc_pasillo)
-        bd['Nivel']         = bd['Ubicacion_out'].apply(calc_nivel)
-        bd['Zona']          = bd['Pasillo'] + '_' + bd['Nivel']
-
-        # Excluir filas con pasillo Libre
-        bd = bd[bd['Pasillo'] != 'Libre']
-
-        # Definir columnas que queremos en las tablas finales
-        cols_export = ['Ubicacion_out','Cod. Articulo_asig','UM',
-                       'Stock Inicial','Salidas','Stock Final',
-                       'Check','Observacion']
-
-        # Crear nuevas tablas sólo con esos encabezados, por cada zona
-        tablas = {}
-        for zona, grupo in bd.groupby('Zona'):
-            # Asegurarnos que zona sea de los 3 pasillos y niveles A/B
+    # 6) Generar rastrero Out
+    if st.button("Generar Rastrero Out", disabled=not('asign' in state and 'df_stock' in state)):
+        bd = pd.merge(state['asign'], state['df_stock'], left_on='Concat1', right_on='Concat2', how='left', suffixes=('_asig','_stk'))
+        bd['UM']='CAJ'; bd['Salidas']=bd['Cajas_x']
+        bd['Stock Final']=bd['Cajas_y'].fillna(0); bd['Stock Inicial']=bd['Salidas']+bd['Stock Final']
+        bd['Check']=''; bd['Observacion']=''
+        bd['Ubicacion_out']=bd['Ubicacion_stk'].combine_first(bd['Ubicacion_asig'])
+        bd['Pasillo']=bd['Ubicacion_out'].apply(calc_pasillo)
+        bd['Nivel']=bd['Ubicacion_out'].apply(calc_nivel)
+        bd['Zona']=bd['Pasillo']+'_'+bd['Nivel']
+        bd=bd[bd['Pasillo']!='Libre'].reset_index(drop=True)
+        bd=bd.sort_values('Ubicacion_out').reset_index(drop=True)
+        cols_export=['Ubicacion_out','Cod. Articulo_asig','UM','Stock Inicial','Salidas','Stock Final','Check','Observacion']
+        tablas={}
+        for zona, df_tab in bd.groupby('Zona'):
             if zona.startswith(('Pasillo_1','Pasillo_2','Pasillo_3')):
-                df_tab = grupo[cols_export].reset_index(drop=True)
-                tablas[zona] = df_tab
-                st.markdown(f"### {zona.replace('_',' — ')}")
-                st.dataframe(df_tab, use_container_width=True)
+                df_tab=df_tab[cols_export].reset_index(drop=True)
+                tablas[zona]=df_tab
+                st.markdown(f"### {zona.replace('_',' — ')}"); st.dataframe(df_tab, use_container_width=True)
+        state['ras_out']=tablas; update_status("Rastrero Out listo ✓", 100)
 
-        # Guardar en sesión para la exportación
-        state['ras_out'] = tablas
-        update_status("Rastrero Out listo ✓", 100)
-    
-    # 6) Descarga a Excel en bloque según las tablas generadas
+
+    # 7) Descarga a Excel
     if tmpl_file and 'ras_out' in state:
         tmpl_bytes = tmpl_file.read()
         try:
@@ -407,7 +383,6 @@ def rastrero_out():
             st.error(f"Error al leer la plantilla: {e}")
             return
 
-        # Comprobar que existan todas las hojas necesarias
         faltantes = [z for z in state['ras_out'] if z not in wb.sheetnames]
         if faltantes:
             st.error(f"No se encontraron las hojas: {', '.join(faltantes)} en la plantilla.")
@@ -417,28 +392,17 @@ def rastrero_out():
             wb2 = openpyxl.load_workbook(BytesIO(tmpl_bytes))
             for hoja, dfp in state['ras_out'].items():
                 ws = wb2[hoja]
-                # 1) Pegado de datos desde B13
                 for i, row in enumerate(dfp.itertuples(index=False), start=13):
                     for j, val in enumerate(row, start=2):
                         ws.cell(row=i, column=j, value=val)
-                # 2) Fecha en I1
                 ws['I1'] = fecha.strftime('%d/%m/%Y')
-                # 3) Nro. Picking en L1↓
                 for idx, pk in enumerate(state['tpick']['Nro. Picking'], start=1):
                     ws.cell(row=idx, column=12, value=pk)
-                # 4) Eliminar filas vacías tras la última con datos
                 last_row = 12 + len(dfp)
                 if ws.max_row > last_row:
                     ws.delete_rows(last_row+1, ws.max_row - last_row)
-                # 5) Fijar área de impresión de B1 hasta I<last_row>
                 ws.print_area = f"B1:I{last_row}"
-
-            buf = BytesIO()
-            wb2.save(buf)
-            buf.seek(0)
-            return buf
-
-
+            buf = BytesIO(); wb2.save(buf); buf.seek(0); return buf
 
         fname = f"FORMATO_RASTRERO_SALIDAS_{fecha.strftime('%d.%m.%Y')}.xlsx"
         st.download_button(
@@ -447,8 +411,6 @@ def rastrero_out():
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-
 
 
 # -------------------------------------------------------------
@@ -520,4 +482,3 @@ elif selected == " Rastrero In":
     rastrero_in()
 elif selected == " Rastrero Out":
     rastrero_out()
-
