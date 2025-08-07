@@ -158,96 +158,243 @@ if 'state_out' not in st.session_state:
     st.session_state.state_out = {}
 
 # =============================================================
-#   5. MÓDULO – RASTRERO IN
+#   5. MÓDULO – RASTRERO IN (con resumen dinámico tras filtros)
 # =============================================================
+
+def render_summary_block(n_regs, sum_cajas, rango, value_font_size='24px', date_font_size='20px'):
+    """
+    Renderiza un bloque de resumen con tres tarjetas: Registros, Cajas y Fechas.
+    """
+    icon_map = ['list', 'cube', 'calendar']
+    labels   = ['Registros', 'Cajas', 'Fechas']
+    values   = [n_regs, sum_cajas, rango]
+    colors   = ['#42a5f5', '#66bb6a', '#ab47bc']
+
+    cols = st.columns(3, gap='large')
+    for col, icon, label, val, bg in zip(cols, icon_map, labels, values, colors):
+        fs = date_font_size if (label == 'Fechas' and date_font_size) else value_font_size
+        col.markdown(f"""
+            <div style="
+                background:{bg}; color:white; border-radius:8px;
+                padding:20px; display:flex; align-items:center;
+                min-height:100px;"
+            >
+              <i class='fa fa-{icon}' style='font-size:32px; margin-right:16px;'></i>
+              <div>
+                <div style='font-size:{fs}; font-weight:bold;'>{val}</div>
+                <div style='font-size:12px; opacity:0.8; text-transform:uppercase;'>{label}</div>
+              </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+
 def rastrero_in():
     st.subheader("📥 Rastrero In")
-    state = st.session_state.state_in
+    state = st.session_state.setdefault('state_in', {})
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ing_file  = st.file_uploader("Flujo de Ingresos", type='xlsx', key='ing_in')
-    with c2:
-        stock_file= st.file_uploader("Stock", type='xlsx', key='stock_in')
-    with c3:
-        tmpl_file = st.file_uploader("Plantilla", type='xlsx', key='tmpl_in')
-    fecha = st.date_input("Fecha del reporte", dt.date.today(), key='fecha_in')
+    # --- Carga de archivos ---
+    with st.container():
+        st.markdown("**Carga de archivos**")
+        u1, u2, u3 = st.columns([1,1,1], gap='medium')
+        with u1:
+            mov_file = st.file_uploader("Movimientos internos", type="xlsx", key="mov_int")
+        with u2:
+            stock_file = st.file_uploader("Stock", type="xlsx", key="stock_in")
+        with u3:
+            tmpl_file = st.file_uploader("Plantilla", type="xlsx", key="tmpl_in")
+    st.markdown("<hr style='margin:8px 0'>", unsafe_allow_html=True)
 
-    # Ingresos
-    if ing_file and 'df_ing' not in state:
-        name = ing_file.name
-        if not name.startswith("ReportConsultasIngresosFlujoIngresos"):
-            update_status("⚠️ Archivo de ingresos incorrecto", 0, False)
+    # --- Procesar Movimientos Internos ---
+    if mov_file and 'T_Mov_Internos' not in state:
+        name = mov_file.name
+        if not name.startswith("ReportConsultasMovimientosInternos"):
+            update_status("⚠️ Archivo Movimientos Internos incorrecto", ok=False)
         else:
-            update_status("Leyendo Flujo Ingresos…", 10)
-            df = pd.read_excel(ing_file)
-            df.columns = (df.columns.str.normalize('NFKD')
-                                        .str.encode('ascii','ignore').str.decode('utf-8')
-                                        .str.strip())
-            df['Codigo Lote Proveedor'] = clean_lote(df['Codigo Lote Proveedor'])
-            state['df_ing'] = df
-            state['motivos'] = ['Todos'] + sorted(df['Motivo'].dropna().unique())
-            update_status("Ingresos listos ✓", 40)
+            update_status("Leyendo Movimientos Internos…", 10)
+            df = pd.read_excel(mov_file)
+            invalid_refs = ["PICKING-TRASLADO","PICKING-SURTIDO","PICKING-PTS-SURTIDO","LPN-TRASLADO"]
+            df = df[~df['Referencia 1'].isin(invalid_refs)]
+            df = df[df['UM Origen'] != 'UNIDAD']
+            df['Glosa'] = df['Glosa'].fillna('Movimiento desde DWEB')
+            df['Categoria'] = ''
+            mask_alma = (df['Motivo']=='CAMBIO DE UBICACION') & df['Ubicación Origen'].str.startswith('B4.RE', na=False)
+            mask_mov  = (df['Motivo']=='CAMBIO DE UBICACION') & ~mask_alma
+            mask_est  = df['Motivo']=='CAMBIO DE ESTADO'
+            df.loc[mask_alma, 'Categoria'] = 'Almacenamiento'
+            df.loc[mask_mov,  'Categoria'] = 'Mov_Interno'
+            df.loc[mask_est,  'Categoria'] = 'Regul_Interna/Cambio_Estado'
+            df['Concat_MI'] = df['Ubicación Destino'].astype(str) + df['Cod. Articulo'].astype(str)
+            df['Fecha Movimiento'] = pd.to_datetime(df['Fecha Movimiento'])
+            state['T_Mov_Internos'] = df
+            update_status("Movimientos Internos listos ✓", 30)
 
-    # Stock
-    if stock_file and 'df_stock' not in state:
-        update_status("Procesando Stock…", 10)
-        state['df_stock'] = preparar_stock(stock_file.read())
-        update_status("Stock listo ✓", 60 if 'df_ing' in state else 40)
+    # --- Procesar Stock para T_Stock_I ---
+    if stock_file and 'T_Stock_I' not in state:
+        update_status("Leyendo Stock Interno…", 40)
+        df_s = pd.read_excel(stock_file)
+        df_s = norm_cols(df_s)
+        df_s['Ubicación_1'] = df_s['Ubicacion']
+        df_s['Cod. Artículo_1'] = df_s['Cod. Articulo']
+        df_s['UM_1'] = df_s['UM']
+        df_stock_i = (df_s.groupby(
+            ['Ubicación_1','Cod. Artículo_1','UM_1'],
+            as_index=False
+        ).agg({'Cant. Final': 'sum'})
+                      .rename(columns={'Cant. Final':'Stock Final_1'}))
+        df_stock_i['Concat_ST'] = (
+            df_stock_i['Ubicación_1'].astype(str)
+            + df_stock_i['Cod. Artículo_1'].astype(str)
+        )
+        state['T_Stock_I'] = df_stock_i
+        st.markdown("#### T_Stock_I")
+        st.dataframe(df_stock_i, use_container_width=True)
+        update_status("Stock Interno listo ✓", 50)
 
-    # Selección lotes
-    lotes_sel = []
-    if 'df_ing' in state:
-        motivo = st.selectbox("Motivo", state['motivos'], key='motivo_in')
-        df_ing = state['df_ing']
-        if motivo != 'Todos':
-            df_ing = df_ing[df_ing['Motivo'] == motivo]
-        vista = df_ing[['Codigo Lote Proveedor','Referencia']].drop_duplicates().reset_index(drop=True)
-        lotes_sel = st.multiselect("Lotes", vista['Codigo Lote Proveedor'], default=vista['Codigo Lote Proveedor'].tolist())
+    # --- Botón para Generar Rastrero In ---
+    # Recalcular df_f para asegurarse que existe
+    if 'T_Mov_Internos' in state:
+        df_all = state['T_Mov_Internos']
+        # Asegurar inicialización de filtros
+        all_cats   = sorted(df_all['Categoria'].unique())
+        all_glosas = sorted(df_all['Glosa'].unique())
+        all_lotes  = sorted(df_all['Lote Proveedor Destino'].astype(str).unique())
+        st.session_state.setdefault('cat_sel', all_cats.copy())
+        st.session_state.setdefault('glosa_sel', all_glosas.copy())
+        st.session_state.setdefault('lote_sel', all_lotes.copy())
+        # Aplicar filtros existentes
+        df_f = df_all[
+            df_all['Categoria'].isin(st.session_state.cat_sel) &
+            df_all['Glosa'].isin(st.session_state.glosa_sel) &
+            df_all['Lote Proveedor Destino'].astype(str).isin(st.session_state.lote_sel)
+        ]
+    else:
+        df_f = pd.DataFrame()
 
-    # Generar
-    if st.button("Generar Rastrero", disabled=not(lotes_sel and 'df_stock' in state)):
-        base = state['df_stock'].copy()
-        base['Lote Proveedor'] = clean_lote(base['Lote Proveedor'])
-        filtro = base[base['Lote Proveedor'].isin(lotes_sel)].copy()
+    # Mostrar botón siempre que ambos archivos estén procesados
+    if 'T_Stock_I' in state and 'T_Mov_Internos' in state:
+    # Mostrar botón siempre que ambos archivos estén procesados
+        if 'T_Mov_Internos' in state and 'T_Stock_I' in state:
+            if st.button("Generar Rastrero In"):
+                # Validar registros filtrados
+                if df_f.empty:
+                    st.error("No registros para filtros seleccionados")
+                else:
+                    # Usar df_f (filtrado) en lugar de df_mov
+                    df_mov = df_f.copy()
+                    df_stock = state['T_Stock_I']
+                    # 1) Agrupar Mov (T_Cruce_In)
+                    cruce = df_mov.groupby('Concat_MI', as_index=False).agg({
+                        'Ubicación Destino': 'first',
+                        'Cod. Articulo': 'first',
+                        'Cant. Destino': 'sum'
+                    }).rename(columns={
+                        'Concat_MI':'Clave',
+                        'Ubicación Destino':'Ubicacion Origen_1',
+                        'Cod. Articulo':'Producto_1',
+                        'Cant. Destino':'Ingresos_1'
+                    })
+                    cruce['UM_1'] = 'CJ'
+                    # 2) Stock por Clave
+                    stock_sum = df_stock.groupby('Concat_ST', as_index=False)['Stock Final_1'].sum()
+                    cruce = cruce.merge(
+                        stock_sum, left_on='Clave', right_on='Concat_ST', how='left'
+                    ).fillna({'Stock Final_1':0})
+                    cruce['Stock Inicial_1'] = cruce['Ingresos_1'] - cruce['Stock Final_1']
+                    cruce['Check_1'] = ''
+                    cruce['Observacion_1'] = ''
+                    state['T_Cruce_In'] = cruce
+                    st.markdown("#### T_Cruce_In")
+                    st.dataframe(cruce, use_container_width=True)
+                    # 3) Generar T_Rastrero_In reordenando columnas
+                    orden = [
+                        ('Ubicacion Origen','Ubicacion Origen_1'),
+                        ('Producto','Producto_1'),
+                        ('UM','UM_1'),
+                        ('Stock Inicial','Stock Inicial_1'),
+                        ('Ingresos','Ingresos_1'),
+                        ('Stock Final','Stock Final_1'),
+                        ('Check','Check_1'),
+                        ('Observacion','Observacion_1')
+                    ]
+                    rastreo = cruce[[src for (_,src) in orden]].copy()
+                    rastreo.columns = [dest for (dest,_) in orden]
+                    state['T_Rastrero_In'] = rastreo
+                    st.markdown("#### T_Rastrero_In")
+                    st.dataframe(rastreo, use_container_width=True)
 
-        filtro = filtro.rename(columns={
-            'Concat_U_A':'Concat_U_A_1','Ubicación':'Ubicación_Z',
-            'Cod. Artículo':'Cod. Artículo_Z','Cajas':'Cajas_Z', 'Nivel':'Nivel_Z'
-        })
-        lookup = base.groupby('Concat_U_A')['Cajas'].sum()
-        filtro['Stock_Final'] = filtro['Concat_U_A_1'].map(lookup).fillna(0)
-        filtro['Stock_Inicial'] = filtro['Stock_Final'] - filtro['Cajas_Z']
-        filtro['Check']=''; filtro['Observaciones']=''
+    # --- Resumen dinámico y filtros ---
+    if 'T_Mov_Internos' in state:
+        df = state['T_Mov_Internos']
+        all_cats   = sorted(df['Categoria'].unique())
+        all_glosas = sorted(df['Glosa'].unique())
+        all_lotes  = sorted(df['Lote Proveedor Destino'].astype(str).unique())
+        st.session_state.setdefault('cat_sel', all_cats.copy())
+        st.session_state.setdefault('glosa_sel', all_glosas.copy())
+        st.session_state.setdefault('lote_sel', all_lotes.copy())
 
-        cols = ['Ubicación_Z','Cod. Artículo_Z','UM',
-                'Stock_Inicial','Cajas_Z','Stock_Final','Check','Observaciones','Nivel_Z']
-        ras_in = filtro[cols]
-        state['ras_in'] = ras_in
+        with st.expander("🔎 Filtros", expanded=True):
+            c1, c2 = st.columns(2, gap='large')
+            with c1:
+                st.multiselect(
+                    "Categoría", all_cats,
+                    key='cat_sel'
+                )
+            with c2:
+                glosa_opts = sorted(df[df['Categoria'].isin(st.session_state.cat_sel)]['Glosa'].unique())
+                valid_glosas = [g for g in st.session_state.glosa_sel if g in glosa_opts]
+                st.session_state['glosa_sel'] = valid_glosas or glosa_opts
+                st.multiselect(
+                    "Glosa", glosa_opts,
+                    key='glosa_sel'
+                )
+            st.markdown("&nbsp;")
+            lote_opts = sorted(
+                df[(df['Categoria'].isin(st.session_state.cat_sel)) & (df['Glosa'].isin(st.session_state.glosa_sel))]
+                ['Lote Proveedor Destino'].astype(str).unique()
+            )
+            valid_lotes = [l for l in st.session_state.lote_sel if l in lote_opts]
+            st.session_state['lote_sel'] = valid_lotes or lote_opts
+            st.multiselect(
+                "Lote", lote_opts,
+                key='lote_sel'
+            )
 
-        alto = ras_in[ras_in['Nivel_Z']=='ALTO'].drop(columns='Nivel_Z')
-        bajo = ras_in[ras_in['Nivel_Z']=='BAJO'].drop(columns='Nivel_Z')
+        df_f = df[
+            df['Categoria'].isin(st.session_state.cat_sel) &
+            df['Glosa'].isin(st.session_state.glosa_sel) &
+            df['Lote Proveedor Destino'].astype(str).isin(st.session_state.lote_sel)
+        ]
+        if df_f.empty:
+            st.error("No registros para filtros seleccionados")
+            return
 
-        st.success("Rastrero generado")
-        with st.expander("🔼 Nivel ALTO", expanded=True): st.dataframe(alto)
-        with st.expander("🔽 Nivel BAJO", expanded=False): st.dataframe(bajo)
-        update_status("Rastrero In generado ✓", 100)
+        n_regs_f    = len(df_f)
+        sum_cajas_f = df_f['Cant. Destino'].sum()
+        try:
+            min_d_f = df_f['Fecha Movimiento'].min()
+            max_d_f = df_f['Fecha Movimiento'].max()
+            dias  = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom']
+            meses = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic']
+            def fmt(d):
+                return f"{dias[d.weekday()]} {d.day} de {meses[d.month-1]}"
+            rango_f = fmt(min_d_f) if min_d_f == max_d_f else f"Desde {fmt(min_d_f)} hasta {fmt(max_d_f)}"
+        except Exception:
+            rango_f = ""
 
-    # Descargar
-    if tmpl_file and 'ras_in' in state:
-        def make_xlsx_in():
-            wb = openpyxl.load_workbook(BytesIO(tmpl_file.read()))
-            alto = state['ras_in'][state['ras_in']['Nivel_Z']=='ALTO'].drop(columns='Nivel_Z')
-            bajo = state['ras_in'][state['ras_in']['Nivel_Z']=='BAJO'].drop(columns='Nivel_Z')
-            def paste(ws, df):
-                for i,row in enumerate(df.itertuples(index=False), start=13):
-                    for j,val in enumerate(row, start=2): ws.cell(row=i,column=j,value=val)
-            paste(wb['R_Nivel_Alto'], alto); paste(wb['R_Nivel_Bajo'], bajo)
-            for ws in (wb['R_Nivel_Alto'], wb['R_Nivel_Bajo']): ws['I1']=fecha.strftime('%d/%m/%Y')
-            out=BytesIO(); wb.save(out); out.seek(0); return out
-        fname=f"FORMATO_RASTRERO_INGRESOS_{fecha.strftime('%d.%m.%Y')}.xlsx"
-        st.download_button("📥 Descargar Excel", data=make_xlsx_in(), file_name=fname,
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.markdown("<hr style='margin:8px 0'>", unsafe_allow_html=True)
+        render_summary_block(
+            n_regs_f, sum_cajas_f, rango_f,
+            value_font_size='24px', date_font_size='20px'
+        )
+        st.markdown("<div style='margin:8px 0'></div>", unsafe_allow_html=True)
+        st.markdown("#### T_Mov_Internos (filtrada)")
+        st.dataframe(df_f, use_container_width=True)
+
+        state['T_R_Categoria'] = df.groupby('Categoria', as_index=False).size()
+        state['T_R_Glosa']     = df.groupby('Glosa', as_index=False).size()
+        state['T_R_Lotes']     = df.groupby('Lote Proveedor Destino', as_index=False).size()
+
+        
 
 # =============================================================
 # 6. Módulo Rastrero Out
