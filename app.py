@@ -333,7 +333,7 @@ def rastrero_in():
                                 ws = wb2[hoja]
                                 # Pegar bloque desde C13
                                 for i, row in enumerate(dfp.itertuples(index=False), start=13):
-                                    for j, val in enumerate(row, start=3):  # C=3
+                                    for j, val in enumerate(row, start=2): #C=2
                                         ws.cell(row=i, column=j, value=val)
                                 # Fecha en I1
                                 ws['I1'] = fecha_val.strftime('%d/%m/%Y')
